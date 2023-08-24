@@ -1,0 +1,168 @@
+算法的直觉详细描述
+	
+
+The main concept of this algorithm is to visualize the trend of the stock market by observing the average value of different times, so as to start trading. In detail, we need two-time values, which contain long and short periods, such as a (one week) and b (one month), b>a. Then we use the two indexes of ab to calculate the average value: for example, we use one week as the time scale, and we have no average value for the data of the first week (because the data of 5 working days must be used to calculate the average value of a), and then Our first mean is on the first day of the second week (that is, the 6th weekday). Then the second man is from the second day of the first week to the first day of the second week, and so on. The same is true for b (there is no data for the first 22 days). Putting the two moving averages into one chart, we can see some intersections. We take the moving average (b) with a large time value as a reference. If the moving average of a (small time value) crosses the moving average of b from the bottom direction, this is the time for us to buy, and vice versa, when we buy After that, when a crosses b down, we sell. We call these two points the golden cross and the dead cross respectively. In Jincha, we believe that the stock is very strong (uptrend), so we buy it, and vice versa, we sell it when it is weak. This method is more suitable for a bull market or a prosperous period. If it is a bear market or depression, it is difficult to have a golden cross. To further refine our algorithm, we will substitute exponential averaging. We don't need all the data to do the calculations, we just need the latest observations, latest forecasts, and previously calculated alpha. In this way, we not only save data costs, but also speed up the operation, but the basic logic is still the same.
+The smaller the number of days the moving average deals with, the more sensitive it is to price fluctuations.
+This method is not to predict the trend but to reflect the current price trend.
+
+variable:
+Short-term length: Generally speaking, 5-10, 20-35, and 50-200 correspond to the short-term, medium-term, and long-term trends of the long-term trend. Here we need to conduct multiple experiments to tune the parameters.
+Stock selection: In order to avoid overfitting and deliberately select stocks with good performance, we can randomly select 6 stocks with small market capitalization on the Shenzhen Stock Exchange.
+Filter noise: Because the stock market moves randomly, in order to reduce the impact of whipsaw on our strategy (time to buy), we need to observe whether the short-term is in an upward trend for two consecutive trading days, if so, then buy if there is a golden cross enter.
+Referring to the benchmark, we take the CSI 300 Index instead.
+
+
+
+https://zhuanlan.zhihu.com/p/32335746
+https://www.joinquant.com/view/community/detail/7f93868fc490a937122366a0ec9aa388
+
+Code:
+# 将实现的算法复制到下面的代码框
+#首先选出小市值股票
+
+# 导入函数库
+from collections import defaultdict
+
+from jqdata import *
+## 选出小市值股票
+def check_stocks(context):
+    # 设定查询条件
+    q = query(
+            valuation.code,
+            valuation.market_cap
+        ).filter(
+            valuation.market_cap.between(20,30)
+        ).order_by(
+            valuation.market_cap.asc()
+        )
+
+    # 选出低市值的股票，构成buylist
+    df = get_fundamentals(q)
+    buylist =list(df['code'])
+
+# 导入函数库
+from collections import defaultdict
+
+from jqdata import *
+
+# 初始化函数，设定基准等等
+def initialize(context):
+    # 设定沪深300作为基准
+    set_benchmark('000300.XSHG')
+    # 开启动态复权模式(真实价格)
+    set_option('use_real_price', True)
+    # 输出内容到日志 log.info()
+    log.info('初始函数开始运行且全局只运行一次')
+    # 过滤掉order系列API产生的比error级别低的log
+    # log.set_level('order', 'error')
+
+    ## 运行函数（reference_security为运行时间的参考标的；传入的标的只做种类区分，因此传入'000300.XSHG'或'510300.XSHG'是一样的）
+      # 开盘前运行
+    run_daily(before_market_open, time='before_open', reference_security='000300.XSHG')
+      # 开盘时运行
+    run_daily(market_open, time='open', reference_security='000300.XSHG')
+      # 收盘后运行
+    run_daily(after_market_close, time='after_close', reference_security='000300.XSHG')
+    
+    # 设置股票池
+    g.security = ["002109.XSHE","002793.XSHE","300510.XSHE","002798.XSHE","002057.XSHE"]
+    #持仓数目
+    g.security_limits = 4
+    g.EMA_history = defaultdict(float)
+
+## 开盘前运行函数
+def before_market_open(context):
+    # 输出运行时间
+    log.info('函数运行时间(before_market_open)：'+str(context.current_dt.time()))
+
+    # 设置交易费率
+    # 将滑点设置为0
+    set_slippage(FixedSlippage(0)) 
+    # 根据不同的时间段设置手续费
+    dt=context.current_dt
+    
+    if dt>datetime.datetime(2013,1, 1):
+        set_order_cost(OrderCost(close_tax=0.001, open_commission=0.0003, close_commission=0.0003, min_commission=5), type='stock')
+        
+    elif dt>datetime.datetime(2011,1, 1):
+        set_order_cost(OrderCost(close_tax=0.001, open_commission=0.001, close_commission=0.001, min_commission=5), type='stock')
+    
+    # TODO 补齐09年以及更早之前的费率情况
+
+
+## 开盘时运行函数
+def market_open(context):
+    log.info('函数运行时间(market_open):'+str(context.current_dt.time()))
+    # 将总资金等分为g.N份，为每只股票配资
+    capital_unit = context.portfolio.portfolio_value / g.security_limits
+    security = g.security
+    to_sell = signal_to_sell(context)
+    to_buy = signal_to_buy(context)
+    
+    for i in range(len(to_sell)):
+        if to_sell[i] == 1:
+            order_target(security[i], 0)
+    
+    for i in range(len(to_buy)):
+        if to_buy[i] == 1:
+            order_target_value(security[i], capital_unit)
+
+def signal_to_sell(context):
+    sell = [0 for _ in range(len(g.security))]
+    for i in range(len(sell)):
+        ema_long_pre, ema_long_cur = get_EMA(g.security[i], context, 10)
+        ema_short_pre, ema_short_cur = get_EMA(g.security[i], context, 5)
+        if ema_short_pre > ema_long_pre and \
+            ema_short_cur < ema_long_cur and \
+            context.portfolio.positions[g.security[i]].closeable_amount > 0:
+            sell[i] = 1
+    return sell
+    
+def signal_to_buy(context):
+    buy = [0 for _ in range(len(g.security))]
+    for i in range(len(buy)):
+        ema_long_pre, ema_long_cur = get_EMA(g.security[i], context, 10)
+        ema_short_pre, ema_short_cur = get_EMA(g.security[i], context, 5)
+        if ema_short_pre < ema_long_pre and \
+            ema_short_cur > ema_long_cur and \
+            context.portfolio.positions[g.security[i]].closeable_amount == 0:
+            buy[i] = 1
+    return buy
+    
+def get_MA(security, days):
+    # 获得前days天的数据，详见API
+    a = attribute_history(security, days, '1d', ['close'])
+    return a["close"].mean()
+        
+def get_EMA(security, context, days):
+    if days == 1:
+        bars = get_bars(security, days+1, "1d", fields=["close"])
+        return bars[-2][0], bars[-1][0]
+    else:
+        key = f"{security}_{days}"
+        alpha = (days-1)/(days+1)
+        EMA_pre = g.EMA_history[key]
+        if EMA_pre != 0:
+            close_new = attribute_history(security, 1, "1d", fields=["close"])["close"][0]
+            EMA_now = alpha*EMA_pre + (1-alpha)*close_new
+            g.EMA_history[key] = EMA_now
+            return EMA_pre, EMA_now
+        else:
+            MA = get_MA(security, days)
+            if isnan(MA):
+                return float("nan"), float("nan")
+            else:
+                g.EMA_history[key] = MA
+                return float("nan"), MA
+
+## 收盘后运行函数
+def after_market_close(context):
+    log.info(str('函数运行时间(after_market_close):'+str(context.current_dt.time())))
+    #得到当天所有成交记录
+    trades = get_trades()
+    for _trade in trades.values():
+        log.info('成交记录：'+str(_trade))
+    log.info('一天结束')
+    log.info('##############################################################')
+
+
