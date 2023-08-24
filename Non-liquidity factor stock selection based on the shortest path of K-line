@@ -1,0 +1,143 @@
+Factor Name
+Non-liquidity factor stock selection based on the shortest path of K-line
+
+Intuitive Explanation
+People have a preference for liquidity; therefore, lost liquidity needs to be compensated with a price, resulting in a liquidity premium. The better the liquidity, the more active the stock's trading activity in the market. Single transaction impact on the price, bid-ask spread, and transaction costs are also smaller. Trades can also be completed relatively more quickly. Conversely, poor liquidity results in higher liquidity risk (the risk that traders may pay more transaction fees due to lack of liquidity), but from a risk-return perspective, higher risk implies higher return. If we control all risks other than liquidity, stocks with poorer liquidity should yield higher future returns. Thus, we introduce a non-liquidity factor: the higher the ILLIQ, the poorer the liquidity, and vice versa. We analyze stocks with high ILLIQ values here.
+
+Detailed Description (Calculation)
+Traditional metrics like bid-ask spread, turnover rate, and free float market cap are classic indicators to observe liquidity but are imperfect as they can't capture the price concessions made when buying and selling securities due to low liquidity. To address this issue, we try to link trading volume and price changes to reflect liquidity. Since most non-liquidity measures are hard to directly measure or obtain, non-liquidity levels are often indirectly expressed through some proxy variables. Traditional methods try to depict the market impact of stock trading through the effect of unit volume on returns. However, this definition often fails in volatile intraday markets. Therefore, we improve it using the shortest path non-liquidity factor based on K-lines.
+
+Image (Formula): [Image Link] - Here the value represents turnover, and d represents the number of measurement days.
+
+The shortest path is defined as: [Image Link]
+
+The calculation formula is: ShortCut = 2*(High-Low)-|Open-Close|
+
+However, we can see that relying solely on daily frequency data makes it difficult to fully depict the stock's movement path within a day. If a single K-line can be decomposed into multiple K-lines with higher frequencies, then the shortest path of high-frequency K-lines would be closer to the complete path. Using high-frequency K-lines, such as 15-minute or 5-minute intervals, will yield higher accuracy
+
+
+import jqdata
+import pandas as pd
+import numpy as np
+import time
+import datetime
+
+# Initialization function, set benchmark, etc.
+def initialize(context):
+    # Set the HS300 index as the benchmark
+    set_benchmark('000300.XSHG')
+    # Enable dynamic price adjustment (actual price)
+    set_option('use_real_price', True)
+    log.info('Initialization function starts to run and only runs once globally')
+    set_pas()  # 1. Set strategy parameters
+    set_variables()  # 2. Set intermediate variables
+    # Setup the cost of transactions
+    set_order_cost(OrderCost(close_tax=0.001, open_commission=0.0003, close_commission=0.0003, min_commission=5), type='stock')
+    
+    # Schedule functions
+    run_daily(before_market_open, time='before_open', reference_security='000300.XSHG')
+    run_daily(market_open, time='open', reference_security='000300.XSHG')
+    run_daily(after_market_close, time='after_close', reference_security='000300.XSHG')
+
+
+def filterPause(stockList, startDate, endDate):
+    unsuspendStock = []
+    for stock in stockList:
+        flag = get_price(stock, start_date=startDate, end_date=endDate, fields=['paused'])
+        listflag = list(flag['paused'])
+        if (1.0 not in listflag) and (True not in np.isnan(listflag)):
+            unsuspendStock.append(stock)
+    return unsuspendStock
+
+
+def set_pas():
+    g.tc = 30  # Rebalance every 30 days
+    g.num_stocks = 10  # Number of stocks to be selected during each rebalancing
+    g.index = '000300.XSHG'  # Define the stock pool, constituents of A-share index
+    g.stocks = get_index_stocks(g.index)
+    g.fre = '10m'  # Intraday data frequency interval
+    g.days = 5  # Number of days to take the average
+
+
+def set_variables():
+    g.t = 0  # Track the number of days the backtest has run
+    g.if_trade = False  # Whether to trade on the current day
+
+
+def calILLIQ(stock, context_dt, fre, days):
+    startdate = context_dt
+    enddate = context_dt + datetime.timedelta(hours=6)
+    ILLIQ = []
+    count = 0
+    while(count < days):
+        z = get_price(stock, frequency=fre, fields=['open', 'close', 'high', 'low', 'volume'], start_date=startdate, end_date=enddate)
+        use = z.values
+        for i in range(len(z)):
+            ILLIQ.append((2 * (use[i][2] - use[i][3]) - abs(use[i][0] - use[i][1])) / use[i][4])
+        startdate = startdate - datetime.timedelta(days=1)
+        enddate = enddate - datetime.timedelta(days=1)
+        count += 1
+    flagValue = sum(ILLIQ) / days
+    return flagValue
+
+
+# Function to run before market open
+def before_market_open(context):
+    if g.t % g.tc == 0:
+        g.if_trade = True  # Trade every g.tc days
+
+
+# Function to run at market open
+def market_open(context):
+    log.info('Function run time (market_open): ' + str(context.current_dt.time()))
+    if g.if_trade:
+        pastDate = context.current_dt - datetime.timedelta(days=g.days)
+        g.stockPool = filterPause(g.stocks, pastDate, context.current_dt)
+        flagValue = {}
+        for stock in g.stockPool:
+            flagValue[stock] = calILLIQ(stock, context.current_dt, g.fre, g.days)
+        temp = sorted(list(flagValue.items()), key=lambda x: x[1], reverse=True)
+        a = pd.DataFrame(temp).head(g.num_stocks)
+        g.stockList = list(a.iloc[:, 0])
+        # Stocks that should be bought according to the strategy
+        MS_should_buy = g.stockList
+        log.info(MS_should_buy)
+        # Calculate the current total assets for capital allocation
+        Money = context.portfolio.portfolio_value
+        # Calculate market cap weighted weights
+        qz = {}
+        for stock in MS_should_buy:
+            q = query(valuation.market_cap).filter(valuation.code == stock)
+            qz[stock] = get_fundamentals(q)['market_cap'][0]
+        # Compute total market cap
+        totalMarketCap = float(sum(list(qz.values())))
+
+        if totalMarketCap != 0:
+            for stock in MS_should_buy:
+                MonPerStock = qz[stock] / totalMarketCap * Money
+                order_target_value(stock, MonPerStock)
+        else:
+            pass  # Handle the case when totalMarketCap is zero
+
+        # Stocks that can be sold
+        if len(context.portfolio.positions) > 0:
+            holding = context.portfolio.positions
+        else:
+            holding = []
+
+        # Sell stocks that are no longer needed
+        for stock in holding:
+            if stock not in MS_should_buy:
+                order_target_value(stock, 0)
+        # Buy stocks according to allocated weights
+        for stock in MS_should_buy:
+            MonPerStock = qz[stock] / totalMarketCap * Money
+            order_target_value(stock, MonPerStock)
+
+    g.if_trade = False
+
+
+# Function to run after market close
+def after_market_close(context):
+    log.info('End of the day')
+    log.info('##############################################################')
